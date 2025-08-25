@@ -22,8 +22,10 @@ This is my creation, straight from Bigawn to you. AJ-SUM is a RAT for those who 
 Grab this repo, run the scripts (`auto-jug.bat`, `auto-jug.sh`, `auto-jug-macos.sh`), and let AJ-SUM do its thing. Tweak it, learn from it, and use it responsibly. Drop issues or pull requests if you wanna collab—let’s build this tech together, fam!
 
 ### Disclaimer
-This is a remote administration tool for educational and testing purposes only. Use it legally and ethically—I ain’t liable for any misuse. Keep it 100 and stay safe.
+- Some features may not work yet, it is in active development!!!
+- This will be used in a future RAT project im making 👀
+- This is a remote administration tool for educational and testing purposes only. Use it legally and ethically—I ain’t liable for any misuse. Keep it 100 and stay safe.
 
 ---
 
-**Stay crashin’ out, stay juggin’—Bigawn out!** 🚀
+**Stay crashin’ out, stay juggin’—Big Jawn out!** 🚀
